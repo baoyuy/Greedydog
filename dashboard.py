@@ -1,7 +1,8 @@
 import argparse
+import json
 import os
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 import man
 
@@ -40,6 +41,21 @@ def config_page():
 @app.get("/api/state")
 def api_state():
     return make_json(True, data=man.get_dashboard_snapshot())
+
+
+@app.get("/api/stream")
+def api_stream():
+    last_seq = request.args.get("last_seq", default=0, type=int)
+
+    @stream_with_context
+    def generate():
+        for chunk in man.state_bus.stream_sse(man.get_dashboard_snapshot, last_seq=last_seq):
+            yield chunk
+
+    response = Response(generate(), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
 @app.post("/api/start")

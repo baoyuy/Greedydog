@@ -84,6 +84,10 @@
 {% block scripts %}
 <script>
   let latestState = null;
+  let eventSource = null;
+  let lastStreamSeq = 0;
+  let lastEventAt = 0;
+  let fallbackTimer = null;
 
   function renderSummaryBlock(summary) {
     if (!summary) {
@@ -281,6 +285,48 @@
     if (showHint) showFlash("状态已刷新");
   }
 
+  function ensureFallbackPolling() {
+    if (fallbackTimer) {
+      clearInterval(fallbackTimer);
+    }
+    fallbackTimer = setInterval(() => {
+      const idleTooLong = !lastEventAt || (Date.now() - lastEventAt) > 60000;
+      if (document.hidden || idleTooLong) {
+        refreshState(false);
+      }
+    }, 30000);
+  }
+
+  function connectStateStream() {
+    if (eventSource) {
+      eventSource.close();
+    }
+
+    const url = `/api/stream?last_seq=${lastStreamSeq}`;
+    eventSource = new EventSource(url);
+
+    eventSource.addEventListener("state", (evt) => {
+      lastEventAt = Date.now();
+      const payload = JSON.parse(evt.data || "{}");
+      if (payload.event && payload.event.seq) {
+        lastStreamSeq = payload.event.seq;
+      }
+      if (payload.snapshot) {
+        renderState(payload.snapshot);
+      }
+    });
+
+    eventSource.addEventListener("heartbeat", () => {
+      lastEventAt = Date.now();
+    });
+
+    eventSource.onerror = () => {
+      setTimeout(() => {
+        refreshState(false).finally(connectStateStream);
+      }, 3000);
+    };
+  }
+
   async function startStrategy() {
     const result = await api("/api/start", "POST");
     renderState(result.data);
@@ -334,7 +380,14 @@
     showFlash(result.message, !result.ok);
   }
 
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      refreshState(false);
+    }
+  });
+
   refreshState();
-  setInterval(refreshState, 5000);
+  connectStateStream();
+  ensureFallbackPolling();
 </script>
 {% endblock %}

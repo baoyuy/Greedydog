@@ -32,6 +32,9 @@ import pandas as pd
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from binance_client import BinanceClient
+from adapters.binance_adapter import BinanceAdapter
+from services.dashboard_state import build_dashboard_snapshot
+from services.state_bus import state_bus
 
 # ============================================================
 # 一、读取 .env 配置
@@ -123,6 +126,29 @@ ARCHIVE_DIR = runtime_file("archive")
 
 # 当前持仓
 position = None
+LIVE_POSITION_SNAPSHOT_FILE = runtime_file("live_position_snapshot.json")
+MARKET_DATA_RATE_LIMITS = {
+    "/fapi/v1/time": 0.5,
+    "/fapi/v1/ticker/price": 0.5,
+    "/fapi/v1/klines": 1.0,
+    "/fapi/v1/exchangeInfo": 10.0,
+}
+MARKET_DATA_CACHE_TTLS = {
+    "/fapi/v1/time": 0.5,
+    "/fapi/v1/ticker/price": 0.5,
+    "/fapi/v1/klines": 1.0,
+    "/fapi/v1/exchangeInfo": 3600.0,
+}
+MARKET_DATA_CACHE_LABELS = {
+    "/fapi/v1/time": "server_time",
+    "/fapi/v1/ticker/price": "ticker_price",
+    "/fapi/v1/klines": "klines",
+    "/fapi/v1/exchangeInfo": "exchange_info",
+}
+market_data_rate_limit_lock = threading.Lock()
+market_data_last_request_at = {}
+market_data_cache_lock = threading.Lock()
+market_data_cache = {}
 ai_last_analysis_trade_count = -1
 strategy_thread = None
 strategy_stop_event = threading.Event()
@@ -146,6 +172,7 @@ last_trade_kline_open_time = None
 pending_open_decision = None
 pending_signal_kline_open_time = None
 last_open_retry_ts = 0
+binance_adapter = BinanceAdapter()
 
 
 # ============================================================
@@ -368,6 +395,7 @@ if BINANCE_API_KEY and BINANCE_API_SECRET and BINANCE_BASE_URL:
         base_url=BINANCE_BASE_URL,
         proxies=PROXIES
     )
+    binance_adapter.bind(binance_client)
 
 
 def now_str():
@@ -467,6 +495,7 @@ def append_jsonl(file_path, data):
 def set_strategy_state(**kwargs):
     with strategy_state_lock:
         strategy_state.update(kwargs)
+    state_bus.publish("strategy_state_updated", get_strategy_state_snapshot())
 
 
 def get_strategy_state_snapshot():
@@ -524,6 +553,80 @@ def tail_main_log_for_run(limit=60, scan_limit=400):
     run_marker = f"[RUN={RUN_ID}]"
     filtered = [line for line in lines if run_marker in line]
     return filtered[-limit:]
+
+
+def normalize_request_params(params):
+    if params is None:
+        return {}
+    return dict(params)
+
+
+def build_market_cache_key(url, params=None):
+    normalized = tuple(sorted((k, str(v)) for k, v in normalize_request_params(params).items()))
+    return url, normalized
+
+
+def get_market_cache_ttl(url):
+    for suffix, ttl in MARKET_DATA_CACHE_TTLS.items():
+        if url.endswith(suffix):
+            return ttl
+    return 0
+
+
+def get_market_cache_label(url):
+    for suffix, label in MARKET_DATA_CACHE_LABELS.items():
+        if url.endswith(suffix):
+            return label
+    return "market"
+
+
+def get_market_min_interval(url):
+    for suffix, seconds in MARKET_DATA_RATE_LIMITS.items():
+        if url.endswith(suffix):
+            return seconds
+    return 0
+
+
+def get_cached_market_response(url, params=None):
+    ttl = get_market_cache_ttl(url)
+    if ttl <= 0:
+        return None
+
+    cache_key = build_market_cache_key(url, params)
+    now_ts = time.time()
+    with market_data_cache_lock:
+        cached = market_data_cache.get(cache_key)
+        if not cached:
+            return None
+        cached_at, data = cached
+        if now_ts - cached_at > ttl:
+            market_data_cache.pop(cache_key, None)
+            return None
+        return data
+
+
+def set_cached_market_response(url, params, data):
+    ttl = get_market_cache_ttl(url)
+    if ttl <= 0:
+        return
+
+    cache_key = build_market_cache_key(url, params)
+    with market_data_cache_lock:
+        market_data_cache[cache_key] = (time.time(), data)
+
+
+def wait_market_rate_limit(url):
+    min_interval = get_market_min_interval(url)
+    if min_interval <= 0:
+        return
+
+    with market_data_rate_limit_lock:
+        now_ts = time.time()
+        last_ts = market_data_last_request_at.get(url, 0)
+        wait_seconds = min_interval - (now_ts - last_ts)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        market_data_last_request_at[url] = time.time()
 
 
 def cleanup_runtime_snapshots(keep_latest=12):
@@ -977,6 +1080,7 @@ def build_runtime_update_status(source, updates, proposal_id=None):
 def save_runtime_status(status):
     try:
         write_json_file(RUNTIME_STATUS_FILE, status)
+        state_bus.publish("runtime_status_updated", status)
     except Exception:
         pass
 
@@ -1183,12 +1287,14 @@ def get_pending_open_snapshot():
 
 def get_live_account_snapshot():
     """获取实盘账户快照"""
-    if not binance_client:
+    if not binance_adapter.available():
         return None
 
     try:
-        account = binance_client.get_account()
-        positions = binance_client.get_position_risk()
+        account = binance_adapter.get_account()
+        positions = binance_adapter.get_position_risk()
+        account_cache_ttl = getattr(binance_adapter, "get_cache_ttl", lambda *args, **kwargs: 0)("GET", "/fapi/v2/account")
+        position_cache_ttl = getattr(binance_adapter, "get_cache_ttl", lambda *args, **kwargs: 0)("GET", "/fapi/v3/positionRisk")
 
         return {
             "total_wallet_balance": account.get('totalWalletBalance'),
@@ -1202,7 +1308,8 @@ def get_live_account_snapshot():
                     "unrealized_profit": p['unRealizedProfit']
                 }
                 for p in positions if float(p['positionAmt']) != 0
-            ]
+            ],
+            "cached_seconds": max(account_cache_ttl, position_cache_ttl)
         }
     except Exception as e:
         log_error(f"查询账户信息失败: {e}")
@@ -1212,8 +1319,8 @@ def get_live_account_snapshot():
 def get_symbol_exchange_info(symbol):
     """获取交易对规则信息"""
     try:
-        if binance_client:
-            data = binance_client.get_exchange_info()
+        if binance_adapter.available():
+            data = binance_adapter.get_exchange_info()
         else:
             url = f"{BASE_URL}/fapi/v1/exchangeInfo"
             data = http_get(url)
@@ -1307,15 +1414,14 @@ def format_order_qty(symbol, qty):
 
 def get_order_trades(symbol, order_id, max_attempts=5, retry_delay_seconds=0.2):
     """查询订单对应的真实成交明细，短轮询等待明细落账后再返回"""
-    if not binance_client:
+    if not binance_adapter.available():
         return []
 
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
         try:
-            params = {"symbol": symbol, "orderId": order_id}
-            trades = binance_client._request("GET", "/fapi/v1/userTrades", params, signed=True)
+            trades = binance_adapter.get_user_trades(symbol=symbol, order_id=order_id)
             if trades:
                 if attempt > 1:
                     log_trade(
@@ -1343,6 +1449,166 @@ def get_order_trades(symbol, order_id, max_attempts=5, retry_delay_seconds=0.2):
     return []
 
 
+def sanitize_position_for_storage(raw_position):
+    """把持仓对象转换为可 JSON 持久化的结构"""
+    if raw_position is None:
+        return None
+
+    return json.loads(json.dumps(raw_position, ensure_ascii=False, default=str))
+
+
+def persist_live_position_snapshot():
+    """把当前实盘持仓快照写入文件，供重启恢复使用"""
+    if TRADING_MODE != "LIVE":
+        return
+
+    try:
+        if position is None:
+            if os.path.exists(LIVE_POSITION_SNAPSHOT_FILE):
+                os.remove(LIVE_POSITION_SNAPSHOT_FILE)
+            return
+
+        snapshot = sanitize_position_for_storage(position)
+        write_json_file(LIVE_POSITION_SNAPSHOT_FILE, snapshot)
+    except Exception as e:
+        log_error(f"写入实盘持仓快照失败: {e}")
+
+
+def clear_live_position_snapshot():
+    """删除本地实盘持仓快照"""
+    try:
+        if os.path.exists(LIVE_POSITION_SNAPSHOT_FILE):
+            os.remove(LIVE_POSITION_SNAPSHOT_FILE)
+    except Exception as e:
+        log_error(f"删除实盘持仓快照失败: {e}")
+
+
+def rebuild_live_position_from_exchange(exchange_position):
+    """根据交易所真实持仓重建本地持仓对象"""
+    global position
+
+    if not exchange_position:
+        return False
+
+    try:
+        position_amt = float(exchange_position.get("positionAmt", 0) or 0)
+        if position_amt == 0:
+            return False
+
+        entry_price = float(exchange_position.get("entryPrice", 0) or 0)
+        if entry_price <= 0:
+            raise ValueError(f"真实持仓入场价异常: {exchange_position}")
+
+        qty = abs(position_amt)
+        side = "LONG" if position_amt > 0 else "SHORT"
+        entry_notional = abs(position_amt * entry_price)
+        unrealized_profit = float(exchange_position.get("unRealizedProfit", 0) or 0)
+        leverage_value = exchange_position.get("leverage")
+
+        local_snapshot = read_json_file_if_exists(LIVE_POSITION_SNAPSHOT_FILE, {})
+        local_symbol = local_snapshot.get("symbol") if isinstance(local_snapshot, dict) else None
+        local_side = local_snapshot.get("side") if isinstance(local_snapshot, dict) else None
+        local_trade_id = local_snapshot.get("trade_id") if isinstance(local_snapshot, dict) else None
+        local_decision_snapshot = local_snapshot.get("decision_snapshot") if isinstance(local_snapshot, dict) else None
+        local_signal_time = local_snapshot.get("signal_kline_open_time") if isinstance(local_snapshot, dict) else None
+        local_entry_order_id = local_snapshot.get("entry_order_id") if isinstance(local_snapshot, dict) else None
+        local_entry_fee = local_snapshot.get("entry_fee") if isinstance(local_snapshot, dict) else None
+        local_entry_fee_source = local_snapshot.get("entry_fee_source") if isinstance(local_snapshot, dict) else None
+        local_entry_commission_asset = local_snapshot.get("entry_commission_asset") if isinstance(local_snapshot, dict) else None
+        local_entry_trade_details = local_snapshot.get("entry_trade_details") if isinstance(local_snapshot, dict) else None
+        local_entry_raw_order = local_snapshot.get("entry_raw_order") if isinstance(local_snapshot, dict) else None
+        local_entry_order_status = local_snapshot.get("entry_order_status") if isinstance(local_snapshot, dict) else None
+        local_entry_time_text = local_snapshot.get("entry_time") if isinstance(local_snapshot, dict) else None
+
+        try:
+            restored_entry_time = datetime.fromisoformat(local_entry_time_text) if local_entry_time_text else datetime.now()
+        except Exception:
+            restored_entry_time = datetime.now()
+
+        if local_symbol != SYMBOL or local_side != side:
+            local_trade_id = None
+            local_decision_snapshot = None
+            local_signal_time = None
+            local_entry_order_id = None
+            local_entry_fee = None
+            local_entry_fee_source = None
+            local_entry_commission_asset = None
+            local_entry_trade_details = None
+            local_entry_raw_order = None
+            local_entry_order_status = None
+
+        position = {
+            "run_id": RUN_ID,
+            "trade_id": local_trade_id or f"{SYMBOL}_{side}_restored_{int(time.time())}",
+            "symbol": SYMBOL,
+            "side": side,
+            "entry_time": restored_entry_time,
+            "entry_price": entry_price,
+            "qty": qty,
+            "notional_usdt": entry_notional,
+            "entry_notional": entry_notional,
+            "entry_fee": float(local_entry_fee or 0),
+            "entry_fee_source": local_entry_fee_source or "restored_snapshot_or_unknown",
+            "entry_commission_asset": local_entry_commission_asset or "USDT",
+            "decision_snapshot": local_decision_snapshot,
+            "signal_kline_open_time": local_signal_time,
+            "status": "OPEN",
+            "trading_mode": "LIVE",
+            "entry_order_id": local_entry_order_id,
+            "entry_order_status": local_entry_order_status or "RESTORED_FROM_EXCHANGE",
+            "entry_raw_order": local_entry_raw_order,
+            "entry_trade_details": local_entry_trade_details or [],
+            "restored_from_exchange": True,
+            "exchange_position_amt": position_amt,
+            "exchange_break_even_price": float(exchange_position.get("breakEvenPrice", 0) or 0),
+            "exchange_unrealized_profit": unrealized_profit,
+            "leverage": int(leverage_value) if leverage_value not in [None, ""] else LEVERAGE
+        }
+
+        persist_live_position_snapshot()
+        log_trade(
+            f"[实盘恢复] 已从交易所重建持仓 | symbol={SYMBOL} | side={side} | "
+            f"qty={qty:.8f} | entry_price={entry_price:.8f} | unrealized={unrealized_profit:.8f}"
+        )
+        return True
+    except Exception as e:
+        log_error(f"从交易所重建持仓失败: {e}")
+        return False
+
+
+def restore_live_position_if_needed():
+    """程序启动时尝试从交易所真实持仓恢复本地状态"""
+    global position
+
+    if TRADING_MODE != "LIVE":
+        clear_live_position_snapshot()
+        return False
+
+    if not binance_adapter.available():
+        log_error("实盘恢复失败：币安客户端未初始化")
+        return False
+
+    if position is not None:
+        return True
+
+    try:
+        positions = binance_adapter.get_position_risk(SYMBOL)
+        active_positions = [p for p in positions if abs(float(p.get("positionAmt", 0) or 0)) > 0]
+
+        if not active_positions:
+            clear_live_position_snapshot()
+            log_trade(f"[实盘恢复] 未检测到 {SYMBOL} 的真实持仓")
+            return False
+
+        restored = rebuild_live_position_from_exchange(active_positions[0])
+        if len(active_positions) > 1:
+            log_error(f"检测到多个真实持仓记录，当前仅恢复第一条 | count={len(active_positions)}")
+        return restored
+    except Exception as e:
+        log_error(f"恢复真实持仓失败: {e}")
+        return False
+
+
 def aggregate_order_trade_details(trades):
     """聚合订单成交明细，得到真实手续费和已实现盈亏"""
     total_commission = 0.0
@@ -1365,33 +1631,7 @@ def aggregate_order_trade_details(trades):
 
 
 def get_dashboard_snapshot():
-    return {
-        "server_time": now_str(),
-        "run_id": RUN_ID,
-        "strategy_state": get_strategy_state_snapshot(),
-        "summary": get_dual_summary_snapshot(),
-        "strategy_params": get_strategy_param_snapshot(),
-        "ai_config": get_ai_runtime_snapshot(),
-        "position": get_position_snapshot(),
-        "pending_open": get_pending_open_snapshot(),
-        "pending_ai_suggestion": get_pending_ai_suggestion_snapshot(),
-        "runtime_update_status": get_runtime_status(),
-        "trading_mode": {
-            "mode": TRADING_MODE,
-            "api_configured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
-            "base_url": BINANCE_BASE_URL
-        },
-        "live_account": get_live_account_snapshot() if TRADING_MODE == "LIVE" else None,
-        "recent_trades": read_recent_jsonl(TRADE_DETAIL_JSONL_FILE, limit=20),
-        "recent_ai_records": read_recent_jsonl(AI_SUGGESTION_JSONL_FILE, limit=10),
-        "logs": {
-            "main": tail_main_log_for_run(limit=60),
-            "error": tail_text_file(ERROR_LOG_FILE, limit=20),
-            "trade": tail_text_file(TRADE_LOG_FILE, limit=30),
-            "position": tail_text_file(POSITION_LOG_FILE, limit=20),
-            "summary": tail_text_file(SUMMARY_LOG_FILE, limit=20)
-        }
-    }
+    return build_dashboard_snapshot(man_module=__import__(__name__))
 
 
 def prompt_user_confirmation(prompt_text, default_no=True):
@@ -1777,18 +2017,28 @@ def http_get(url, params=None):
     """
     统一 GET 请求函数
     """
+    normalized_params = normalize_request_params(params)
+    cached = get_cached_market_response(url, normalized_params)
+    if cached is not None:
+        return cached
+
+    wait_market_rate_limit(url)
+
     try:
         response = requests.get(
             url=url,
-            params=params,
+            params=normalized_params,
             timeout=15,
             proxies=PROXIES,
             headers={"User-Agent": "Mozilla/5.0"}
         )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        set_cached_market_response(url, normalized_params, data)
+        return data
     except Exception as e:
-        raise Exception(f"请求失败 | url={url} | params={params} | proxies={PROXIES} | error={e}")
+        cache_label = get_market_cache_label(url)
+        raise Exception(f"请求失败 | api={cache_label} | url={url} | params={normalized_params} | proxies={PROXIES} | error={e}")
 
 
 # ============================================================
@@ -2567,6 +2817,7 @@ def simulate_open_position(decision, signal_kline_open_time):
         "signal_kline_open_time": signal_kline_open_time,
         "status": "OPEN"
     }
+    persist_live_position_snapshot()
 
     direction_text = "做多" if side == "LONG" else "做空"
 
@@ -2588,9 +2839,9 @@ def simulate_open_position(decision, signal_kline_open_time):
 
 def live_open_position(decision, signal_kline_open_time):
     """实盘开仓 - 第二阶段：真实下单并记录交易所返回数据"""
-    global position, binance_client
+    global position
 
-    if not binance_client:
+    if not binance_adapter.available():
         raise ValueError("实盘模式未配置币安 API")
 
     side = decision["side"]
@@ -2598,7 +2849,7 @@ def live_open_position(decision, signal_kline_open_time):
 
     # 查询真实手续费率
     try:
-        commission_info = binance_client.get_commission_rate(SYMBOL)
+        commission_info = binance_adapter.get_commission_rate(SYMBOL)
         taker_rate = float(commission_info['takerCommissionRate'])
         log_trade(f"[实盘模式] 查询到真实 taker 费率: {taker_rate}")
     except Exception as e:
@@ -2607,7 +2858,7 @@ def live_open_position(decision, signal_kline_open_time):
 
     # 确认不存在真实持仓
     try:
-        positions = binance_client.get_position_risk(SYMBOL)
+        positions = binance_adapter.get_position_risk(SYMBOL)
         for pos in positions:
             if float(pos['positionAmt']) != 0:
                 raise ValueError(f"检测到真实持仓未清空，拒绝重复开仓: {pos}")
@@ -2624,7 +2875,7 @@ def live_open_position(decision, signal_kline_open_time):
 
     log_trade(f"[实盘模式] 准备下单 | side={order_side} | qty={qty_text} | 估算价格={mark_price:.6f}")
 
-    order = binance_client.new_order(
+    order = binance_adapter.new_order(
         symbol=SYMBOL,
         side=order_side,
         order_type="MARKET",
@@ -2635,7 +2886,7 @@ def live_open_position(decision, signal_kline_open_time):
     if not order_id:
         raise ValueError(f"下单返回缺少 orderId: {order}")
 
-    order_detail = binance_client.get_order(SYMBOL, order_id)
+    order_detail = binance_adapter.get_order(SYMBOL, order_id)
     entry_trade_rows = get_order_trades(SYMBOL, order_id)
 
     executed_qty = float(order_detail.get("executedQty", 0) or 0)
@@ -2687,6 +2938,7 @@ def live_open_position(decision, signal_kline_open_time):
         "entry_raw_order": order_detail,
         "entry_trade_details": entry_trade_rows
     }
+    persist_live_position_snapshot()
 
     direction_text = "做多" if side == "LONG" else "做空"
 
@@ -2888,16 +3140,17 @@ def simulate_close_position(exit_price, close_reason):
     maybe_trigger_auto_ai_optimizer()
 
     position = None
+    clear_live_position_snapshot()
 
 
 def live_close_position(close_reason):
     """实盘平仓 - 第二阶段：真实下单并尽量使用交易所回报数据"""
-    global position, binance_client
+    global position
 
     if position is None:
         return
 
-    if not binance_client:
+    if not binance_adapter.available():
         raise ValueError("实盘模式未配置币安 API")
 
     qty = position["qty"]
@@ -2911,7 +3164,7 @@ def live_close_position(close_reason):
 
     log_trade(f"[实盘模式] 准备平仓 | side={order_side} | qty={qty_text} | close_reason={close_reason}")
 
-    order = binance_client.new_order(
+    order = binance_adapter.new_order(
         symbol=SYMBOL,
         side=order_side,
         order_type="MARKET",
@@ -2923,7 +3176,7 @@ def live_close_position(close_reason):
     if not order_id:
         raise ValueError(f"平仓返回缺少 orderId: {order}")
 
-    order_detail = binance_client.get_order(SYMBOL, order_id)
+    order_detail = binance_adapter.get_order(SYMBOL, order_id)
     exit_trade_rows = get_order_trades(SYMBOL, order_id)
 
     executed_qty = float(order_detail.get("executedQty", 0) or 0)
@@ -3059,27 +3312,15 @@ def live_close_position(close_reason):
     log_trade("========== 平仓成功 ==========")
     log_trade(f"[实盘] 交易对: {SYMBOL}")
     log_trade(f"方向: {direction_text}")
-    log_trade(f"开仓订单ID: {position.get('entry_order_id')}")
-    log_trade(f"平仓订单ID: {order_id}")
-    log_trade(f"开仓价(真实成交均价): {entry_price:.6f}")
-    log_trade(f"平仓价(真实成交均价): {avg_price:.6f}")
-    log_trade(f"开仓金额(真实成交额): {position['entry_notional']:.6f} U")
-    log_trade(f"平仓金额(真实成交额): {exit_notional:.6f} U")
-    log_trade(f"开仓手续费: {position['entry_fee']:.6f} U")
-    log_trade(f"平仓手续费: {exit_fee:.6f} {commission_asset}")
-    log_trade(f"总手续费: {total_fee:.6f} U")
-    log_trade(f"毛利润(公式): {gross_pnl:.6f} U")
-    log_trade(f"交易所已实现盈亏: {realized_pnl_from_exchange:.6f} U")
-    log_trade(f"净利润: {net_pnl:.6f} U")
-    log_trade(f"收益率: {pnl_pct:.4%}")
     log_trade(f"结果: {result_text}")
     log_trade(f"持仓时间: {hold_seconds} 秒")
     log_trade(f"平仓原因: {close_reason}")
 
+    position = None
+    clear_live_position_snapshot()
+
     print_summary()
     maybe_trigger_auto_ai_optimizer()
-
-    position = None
 
 
 # ============================================================
@@ -3393,6 +3634,8 @@ def run_strategy_service(start_ai_optimize_now=False):
             set_strategy_state(last_error="无法连接 Binance Futures", last_message="startup_failed")
             return
 
+        restore_live_position_if_needed()
+
         if not check_symbol_valid(SYMBOL):
             set_strategy_state(last_error="交易对无效", last_message="startup_failed")
             return
@@ -3534,6 +3777,7 @@ def reload_env_config():
             base_url=BINANCE_BASE_URL,
             proxies=PROXIES
         )
+        binance_adapter.bind(binance_client)
     else:
         binance_client = None
 
