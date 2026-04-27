@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>量化策略控制面板</title>
+  <style>
+    :root {
+      --bg: #f9f9f9;
+      --panel: #ffffff;
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --brand: #0f766e;
+      --brand-2: #d97706;
+      --danger: #b91c1c;
+      --shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.6;
+    }
+    .wrap {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .hero {
+      margin-bottom: 20px;
+    }
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    .hero p {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .btn, button {
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 14px;
+      cursor: pointer;
+      color: white;
+      background: var(--brand);
+      box-shadow: var(--shadow);
+    }
+    .btn.secondary, button.secondary { background: var(--brand-2); }
+    .btn.danger, button.danger { background: var(--danger); }
+    .btn.ghost, button.ghost {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      box-shadow: none;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+      font-weight: 600;
+    }
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--line);
+      gap: 12px;
+    }
+    .metric:last-child { border-bottom: 0; }
+    .metric .label { color: var(--muted); }
+    .metric .value { font-weight: 500; text-align: right; }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 8px;
+      background: #9ca3af;
+    }
+    .status-running { background: #16a34a; }
+    .status-stopped { background: #dc2626; }
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #1f2937;
+      background: #f9fafb;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 400px;
+      overflow: auto;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .field label {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .field input[type="text"],
+    .field input[type="password"],
+    .field input[type="number"] {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      background: white;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .flash {
+      position: sticky;
+      top: 10px;
+      z-index: 20;
+      margin-bottom: 12px;
+      display: none;
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: #1f2937;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="flash" class="flash"></div>
+
+    <section class="hero">
+      <h1>量化策略控制面板</h1>
+      <p>单列纵向布局 · 状态轮询 · 策略启停 · AI 参数优化</p>
+      <div class="toolbar">
+        <button onclick="startStrategy()">启动策略</button>
+        <button class="danger" onclick="stopStrategy()">停止策略</button>
+        <button class="secondary" onclick="analyzeAI()">手动 AI 分析</button>
+        <button class="ghost" onclick="refreshState()">立即刷新</button>
+      </div>
+    </section>
+
+    <div class="card">
+      <h2>运行状态</h2>
+      <div id="strategy-status"></div>
+    </div>
+
+    <div class="card">
+      <h2>参数生效状态</h2>
+      <div id="runtime-update-status"></div>
+    </div>
+
+    <div class="card">
+      <h2>交易摘要</h2>
+      <div id="summary-metrics"></div>
+    </div>
+
+    <div class="card">
+      <h2>当前持仓</h2>
+      <div id="position-metrics"></div>
+    </div>
+
+    <div class="card">
+      <h2>待开仓</h2>
+      <div id="pending-open"></div>
+    </div>
+
+    <div class="card">
+      <div class="panel-header">
+        <h2>待审批 AI 建议</h2>
+        <div class="toolbar">
+          <button class="secondary" onclick="applyAIProposal()">应用建议</button>
+          <button class="danger" onclick="rejectAIProposal()">拒绝建议</button>
+        </div>
+      </div>
+      <div id="pending-ai"></div>
+    </div>
+
+    <div class="card">
+      <h2>当前策略参数</h2>
+      <pre id="strategy-params"></pre>
+    </div>
+
+    <div class="card">
+      <h2>当前 AI 运行配置</h2>
+      <pre id="ai-config-view"></pre>
+    </div>
+
+    <div class="card">
+      <h2>AI 配置</h2>
+      <form id="ai-config-form" onsubmit="saveAIConfig(event)">
+        <div class="checkbox-row">
+          <input id="AI_ENABLED" type="checkbox">
+          <label for="AI_ENABLED">启用 AI 参数优化</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="AI_AUTO_OPTIMIZE_ENABLED" type="checkbox">
+          <label for="AI_AUTO_OPTIMIZE_ENABLED">启用自动触发</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="AI_REQUIRE_CONFIRM_ON_MANUAL" type="checkbox">
+          <label for="AI_REQUIRE_CONFIRM_ON_MANUAL">手动分析需要确认</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="AI_REQUIRE_CONFIRM_ON_AUTO" type="checkbox">
+          <label for="AI_REQUIRE_CONFIRM_ON_AUTO">自动分析需要确认</label>
+        </div>
+
+        <div class="field">
+          <label for="AI_BASE_URL">AI_BASE_URL</label>
+          <input id="AI_BASE_URL" type="text" placeholder="https://your-relay.example/v1">
+        </div>
+        <div class="field">
+          <label for="AI_API_KEY">AI_API_KEY</label>
+          <input id="AI_API_KEY" type="password" placeholder="sk-...">
+        </div>
+        <div class="field">
+          <label for="AI_MODEL">AI_MODEL</label>
+          <input id="AI_MODEL" type="text" placeholder="gpt-4o-mini">
+        </div>
+
+        <div class="field">
+          <label for="AI_TIMEOUT_SECONDS">超时秒数</label>
+          <input id="AI_TIMEOUT_SECONDS" type="number" min="5" step="1">
+        </div>
+        <div class="field">
+          <label for="AI_AUTO_TRIGGER_MIN_WIN_RATE">自动触发胜率阈值</label>
+          <input id="AI_AUTO_TRIGGER_MIN_WIN_RATE" type="number" min="0" max="100" step="0.1">
+        </div>
+        <div class="field">
+          <label for="AI_AUTO_TRIGGER_MIN_TRADES">最少交易数</label>
+          <input id="AI_AUTO_TRIGGER_MIN_TRADES" type="number" min="1" step="1">
+        </div>
+
+        <button type="submit">保存 AI 配置</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>最近成交</h2>
+      <div id="recent-trades-table"></div>
+    </div>
+
+    <div class="card">
+      <h2>主日志（当前运行）</h2>
+      <pre id="main-log"></pre>
+    </div>
+
+    <div class="card">
+      <h2>错误日志</h2>
+      <pre id="error-log"></pre>
+    </div>
+  </div>
+
+  <script>
+    let latestState = null;
+
+    function showFlash(message, isError = false) {
+      const el = document.getElementById("flash");
+      el.style.display = "block";
+      el.style.background = isError ? "#b91c1c" : "#1f2937";
+      el.textContent = message;
+      setTimeout(() => {
+        el.style.display = "none";
+      }, 3000);
+    }
+
+    async function api(url, method = "GET", body = null) {
+      const options = { method, headers: {} };
+      if (body) {
+        options.headers["Content-Type"] = "application/json";
+        options.body = JSON.stringify(body);
+      }
+      const response = await fetch(url, options);
+      return await response.json();
+    }
+
+    function kvRow(label, value) {
+      const text = value === null || value === undefined || value === "" ? "-" : value;
+      return `<div class="metric"><div class="label">${label}</div><div class="value">${text}</div></div>`;
+    }
+
+    function renderState(data) {
+      latestState = data;
+      const strategy = data.strategy_state || {};
+      const summary = data.summary || {};
+      const position = data.position;
+      const pendingOpen = data.pending_open;
+      const pendingAi = data.pending_ai_suggestion;
+      const runtimeStatus = data.runtime_update_status;
+
+      const statusClass = strategy.running ? "status-running" : "status-stopped";
+      document.getElementById("strategy-status").innerHTML = [
+        kvRow("服务时间", data.server_time),
+        kvRow("运行 ID", data.run_id),
+        kvRow("状态", `<span><span class="status-dot ${statusClass}"></span>${strategy.running ? "运行中" : "已停止"}</span>`),
+        kvRow("启动时间", strategy.started_at),
+        kvRow("停止时间", strategy.stopped_at),
+        kvRow("线程存活", strategy.thread_alive ? "是" : "否"),
+        kvRow("消息", strategy.last_message),
+        kvRow("最近错误", strategy.last_error || "-"),
+      ].join("");
+
+      document.getElementById("runtime-update-status").innerHTML = renderRuntimeStatus(runtimeStatus);
+
+      document.getElementById("summary-metrics").innerHTML = [
+        kvRow("总交易数", summary.total_trades),
+        kvRow("胜率", summary.win_rate_percent !== undefined ? `${summary.win_rate_percent}%` : "-"),
+        kvRow("净利润", summary.total_net_pnl),
+        kvRow("总手续费", summary.total_fee),
+        kvRow("最大盈利", summary.max_profit),
+        kvRow("最大亏损", summary.max_loss),
+      ].join("");
+
+      document.getElementById("position-metrics").innerHTML = position ? [
+        kvRow("方向", position.side),
+        kvRow("开仓时间", position.entry_time),
+        kvRow("开仓价", position.entry_price),
+        kvRow("数量", position.qty),
+        kvRow("名义金额", position.notional_usdt),
+        kvRow("状态", position.status),
+      ].join("") : '<div class="muted">当前无持仓</div>';
+
+      document.getElementById("pending-open").innerHTML = pendingOpen ? [
+        kvRow("信号时间", pendingOpen.signal_kline_open_time),
+        kvRow("待开方向", pendingOpen.decision?.side || "-"),
+        kvRow("多头分数", pendingOpen.decision?.long_score || 0),
+        kvRow("空头分数", pendingOpen.decision?.short_score || 0),
+      ].join("") : '<div class="muted">当前没有待开仓信号</div>';
+
+      document.getElementById("pending-ai").innerHTML = renderPendingAI(pendingAi);
+      document.getElementById("strategy-params").textContent = JSON.stringify(data.strategy_params || {}, null, 2);
+      document.getElementById("ai-config-view").textContent = JSON.stringify(data.ai_config || {}, null, 2);
+      document.getElementById("recent-trades-table").innerHTML = renderTrades(data.recent_trades || []);
+
+      document.getElementById("main-log").textContent = (data.logs?.main || []).join("\n");
+      document.getElementById("error-log").textContent = (data.logs?.error || []).join("\n");
+
+      fillAIConfigForm(data.ai_config || {});
+    }
+
+    function renderRuntimeStatus(status) {
+      if (!status || !status.updated_at) {
+        return '<div class="muted">暂无参数更新记录</div>';
+      }
+
+      const immediate = status.effective_immediate || [];
+      const nextCycle = status.effective_next_cycle || [];
+      const nextPosition = status.effective_next_position || [];
+
+      return [
+        kvRow("更新时间", status.updated_at),
+        kvRow("更新来源", status.source),
+        kvRow("已写入内存", status.applied_in_memory ? "是" : "-"),
+        kvRow("已写入 .env", status.persisted_to_env ? "是" : "-"),
+        kvRow("立即生效参数", immediate.length ? immediate.join(", ") : "-"),
+        kvRow("下周期生效参数", nextCycle.length ? nextCycle.join(", ") : "-"),
+        kvRow("其他参数", nextPosition.length ? nextPosition.join(", ") : "-"),
+        kvRow("说明", status.note || "-"),
+      ].join("");
+    }
+
+    function renderPendingAI(pendingAi) {
+      if (!pendingAi) {
+        return '<div class="muted">当前没有待审批的 AI 建议。</div>';
+      }
+
+      const suggestions = pendingAi.validated_result?.suggestions || [];
+      const risks = pendingAi.validated_result?.risk_notes || [];
+
+      const table = suggestions.length ? `
+        <table>
+          <thead>
+            <tr>
+              <th>参数</th>
+              <th>建议值</th>
+              <th>原因</th>
+              <th>预期效果</th>
+              <th>置信度</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${suggestions.map(item => `
+              <tr>
+                <td>${item.param || "-"}</td>
+                <td>${item.value ?? "-"}</td>
+                <td>${item.reason || "-"}</td>
+                <td>${item.expected_effect || "-"}</td>
+                <td>${item.confidence ?? "-"}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      ` : '<div class="muted">没有可展示的修改项。</div>';
+
+      return `
+        <div class="metric"><div class="label">Proposal ID</div><div class="value">${pendingAi.proposal_id || "-"}</div></div>
+        <div class="metric"><div class="label">触发方式</div><div class="value">${pendingAi.trigger_mode || "-"}</div></div>
+        <div class="metric"><div class="label">生成时间</div><div class="value">${pendingAi.created_at || "-"}</div></div>
+        <div class="metric"><div class="label">结论</div><div class="value">${pendingAi.validated_result?.summary || "-"}</div></div>
+        <div style="margin-top:12px">${table}</div>
+        <div style="margin-top:12px">
+          <div class="muted">风险提示</div>
+          <pre>${risks.length ? JSON.stringify(risks, null, 2) : "[]"}</pre>
+        </div>
+      `;
+    }
+
+    function renderTrades(rows) {
+      if (!rows.length) {
+        return '<div class="muted">暂时还没有成交记录。</div>';
+      }
+
+      return `
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>方向</th>
+              <th>净利润</th>
+              <th>收益率</th>
+              <th>平仓原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.slice().reverse().map(row => `
+              <tr>
+                <td>${row.exit_time || row.entry_time || "-"}</td>
+                <td>${row.side || "-"}</td>
+                <td>${row.net_pnl ?? "-"}</td>
+                <td>${row.pnl_pct ?? "-"}</td>
+                <td>${row.close_reason || "-"}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function fillAIConfigForm(config) {
+      const checkboxMap = {
+        AI_ENABLED: config.enabled,
+        AI_AUTO_OPTIMIZE_ENABLED: config.auto_optimize_enabled,
+        AI_REQUIRE_CONFIRM_ON_MANUAL: config.require_confirm_on_manual,
+        AI_REQUIRE_CONFIRM_ON_AUTO: config.require_confirm_on_auto,
+      };
+      Object.entries(checkboxMap).forEach(([key, value]) => {
+        const el = document.getElementById(key);
+        if (el) el.checked = !!value;
+      });
+
+      const map = {
+        AI_BASE_URL: config.base_url,
+        AI_API_KEY: "",
+        AI_MODEL: config.model,
+        AI_TIMEOUT_SECONDS: config.timeout_seconds,
+        AI_AUTO_TRIGGER_MIN_WIN_RATE: config.auto_trigger_min_win_rate,
+        AI_AUTO_TRIGGER_MIN_TRADES: config.auto_trigger_min_trades,
+      };
+
+      Object.entries(map).forEach(([key, value]) => {
+        const el = document.getElementById(key);
+        if (!el) return;
+        if (document.activeElement === el) return;
+        el.value = value ?? "";
+      });
+    }
+
+    async function refreshState(showHint = false) {
+      const result = await api("/api/state");
+      renderState(result.data);
+      if (showHint) showFlash("状态已刷新");
+    }
+
+    async function startStrategy() {
+      const result = await api("/api/start", "POST");
+      renderState(result.data);
+      showFlash(result.message, !result.ok);
+    }
+
+    async function stopStrategy() {
+      const result = await api("/api/stop", "POST");
+      renderState(result.data);
+      showFlash(result.message, !result.ok);
+    }
+
+    async function analyzeAI() {
+      const result = await api("/api/ai/analyze", "POST");
+      renderState(result.data);
+      showFlash(result.ok ? "AI 建议已生成，请审核后应用" : result.message, !result.ok);
+    }
+
+    async function applyAIProposal() {
+      const result = await api("/api/ai/apply", "POST");
+      renderState(result.data);
+      showFlash(result.message, !result.ok);
+    }
+
+    async function rejectAIProposal() {
+      const result = await api("/api/ai/reject", "POST");
+      renderState(result.data);
+      showFlash(result.message, !result.ok);
+    }
+
+    async function saveAIConfig(event) {
+      event.preventDefault();
+      const payload = {
+        AI_ENABLED: document.getElementById("AI_ENABLED").checked,
+        AI_AUTO_OPTIMIZE_ENABLED: document.getElementById("AI_AUTO_OPTIMIZE_ENABLED").checked,
+        AI_REQUIRE_CONFIRM_ON_MANUAL: document.getElementById("AI_REQUIRE_CONFIRM_ON_MANUAL").checked,
+        AI_REQUIRE_CONFIRM_ON_AUTO: document.getElementById("AI_REQUIRE_CONFIRM_ON_AUTO").checked,
+        AI_BASE_URL: document.getElementById("AI_BASE_URL").value.trim(),
+        AI_API_KEY: document.getElementById("AI_API_KEY").value.trim(),
+        AI_MODEL: document.getElementById("AI_MODEL").value.trim(),
+        AI_TIMEOUT_SECONDS: document.getElementById("AI_TIMEOUT_SECONDS").value,
+        AI_AUTO_TRIGGER_MIN_WIN_RATE: document.getElementById("AI_AUTO_TRIGGER_MIN_WIN_RATE").value,
+        AI_AUTO_TRIGGER_MIN_TRADES: document.getElementById("AI_AUTO_TRIGGER_MIN_TRADES").value,
+      };
+
+      const result = await api("/api/ai/config", "POST", payload);
+      renderState(result.data);
+      document.getElementById("AI_API_KEY").value = "";
+      showFlash(result.message, !result.ok);
+    }
+
+    refreshState();
+    setInterval(refreshState, 5000);
+  </script>
+</body>
+</html>

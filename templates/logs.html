@@ -1,0 +1,308 @@
+{% extends "base.html" %}
+
+{% block title %}量化策略日志页{% endblock %}
+{% block nav_logs %}active{% endblock %}
+{% block hero_desc %}运行监控 · 双统计展示 · AI 审批 · 日志轮询{% endblock %}
+
+{% block content %}
+  <div class="toolbar" style="margin-bottom:16px">
+    <button onclick="startStrategy()">启动策略</button>
+    <button class="danger" onclick="stopStrategy()">停止策略</button>
+    <button class="secondary" onclick="analyzeAI()">手动 AI 分析</button>
+    <button class="ghost" onclick="refreshState(true)">立即刷新</button>
+  </div>
+
+  <div class="card">
+    <h2>运行状态</h2>
+    <div id="strategy-status"></div>
+  </div>
+
+  <div class="card">
+    <h2>参数生效状态</h2>
+    <div id="runtime-update-status"></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>本次运行统计</h2>
+      <div id="summary-current"></div>
+    </div>
+    <div class="card">
+      <h2>历史累计统计</h2>
+      <div id="summary-historical"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>当前持仓</h2>
+    <div id="position-metrics"></div>
+  </div>
+
+  <div class="card">
+    <h2>待开仓</h2>
+    <div id="pending-open"></div>
+  </div>
+
+  <div class="card">
+    <div class="panel-header">
+      <h2>待审批 AI 建议</h2>
+      <div class="toolbar">
+        <button class="secondary" onclick="applyAIProposal()">应用建议</button>
+        <button class="danger" onclick="rejectAIProposal()">拒绝建议</button>
+      </div>
+    </div>
+    <div id="pending-ai"></div>
+  </div>
+
+  <div class="card">
+    <h2>最近成交</h2>
+    <div id="recent-trades-table"></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>主日志（当前运行）</h2>
+      <pre id="main-log"></pre>
+    </div>
+    <div class="card">
+      <h2>错误日志</h2>
+      <pre id="error-log"></pre>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  let latestState = null;
+
+  function renderSummaryBlock(summary) {
+    if (!summary) {
+      return '<div class="muted">暂无统计数据</div>';
+    }
+    return [
+      kvRow("运行 ID", summary.run_id),
+      kvRow("总交易数", summary.total_trades),
+      kvRow("胜率", summary.win_rate_percent !== undefined ? `${summary.win_rate_percent}%` : "-"),
+      kvRow("盈利次数", summary.win_trades),
+      kvRow("亏损次数", summary.loss_trades),
+      kvRow("持平次数", summary.flat_trades),
+      kvRow("净利润", summary.total_net_pnl),
+      kvRow("总手续费", summary.total_fee),
+      kvRow("平均单笔净利润", summary.average_net_pnl_per_trade),
+      kvRow("最大盈利", summary.max_profit),
+      kvRow("最大亏损", summary.max_loss)
+    ].join("");
+  }
+
+  function renderRuntimeStatus(status) {
+    if (!status || !status.updated_at) {
+      return '<div class="muted">暂无参数更新记录</div>';
+    }
+
+    const immediate = status.effective_immediate || [];
+    const nextCycle = status.effective_next_cycle || [];
+    const nextPosition = status.effective_next_position || [];
+
+    return [
+      kvRow("更新时间", status.updated_at),
+      kvRow("更新来源", status.source),
+      kvRow("已写入内存", status.applied_in_memory ? "是" : "-"),
+      kvRow("已写入 .env", status.persisted_to_env ? "是" : "-"),
+      kvRow("立即生效参数", immediate.length ? immediate.join(", ") : "-"),
+      kvRow("下周期生效参数", nextCycle.length ? nextCycle.join(", ") : "-"),
+      kvRow("其他参数", nextPosition.length ? nextPosition.join(", ") : "-"),
+      kvRow("说明", status.note || "-")
+    ].join("");
+  }
+
+  function renderPendingAI(pendingAi) {
+    if (!pendingAi) {
+      return '<div class="muted">当前没有待审批的 AI 建议。</div>';
+    }
+
+    const editableSuggestions = pendingAi.editable_suggestions || [];
+    const risks = pendingAi.validated_result?.risk_notes || [];
+
+    const table = editableSuggestions.length ? `
+      <table>
+        <thead>
+          <tr>
+            <th>启用</th>
+            <th>参数</th>
+            <th>建议值</th>
+            <th>原因</th>
+            <th>预期效果</th>
+            <th>置信度</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${editableSuggestions.map((item, idx) => `
+            <tr>
+              <td><input type="checkbox" data-param="${item.param}" ${item.enabled ? 'checked' : ''} onchange="toggleAISuggestion(this)"></td>
+              <td>${item.param || "-"}</td>
+              <td><input type="text" data-param="${item.param}" value="${item.current_value ?? ""}" onchange="editAISuggestionValue(this)" style="width:100px;padding:4px;border:1px solid var(--line);border-radius:4px"></td>
+              <td>${item.reason || "-"}</td>
+              <td>${item.expected_effect || "-"}</td>
+              <td>${item.confidence ?? "-"}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    ` : '<div class="muted">没有可展示的修改项。</div>';
+
+    return `
+      <div class="metric"><div class="label">Proposal ID</div><div class="value">${pendingAi.proposal_id || "-"}</div></div>
+      <div class="metric"><div class="label">触发方式</div><div class="value">${pendingAi.trigger_mode || "-"}</div></div>
+      <div class="metric"><div class="label">生成时间</div><div class="value">${pendingAi.created_at || "-"}</div></div>
+      <div class="metric"><div class="label">结论</div><div class="value">${pendingAi.validated_result?.summary || "-"}</div></div>
+      <div style="margin-top:12px">${table}</div>
+      <div style="margin-top:12px">
+        <div class="muted">风险提示</div>
+        <pre>${risks.length ? JSON.stringify(risks, null, 2) : "[]"}</pre>
+      </div>
+    `;
+  }
+
+  function renderTrades(rows) {
+    if (!rows.length) {
+      return '<div class="muted">暂时还没有成交记录。</div>';
+    }
+
+    return `
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>方向</th>
+            <th>净利润</th>
+            <th>收益率</th>
+            <th>平仓原因</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.slice().reverse().map(row => `
+            <tr>
+              <td>${row.exit_time || row.entry_time || "-"}</td>
+              <td>${row.side || "-"}</td>
+              <td>${row.net_pnl ?? "-"}</td>
+              <td>${row.pnl_pct ?? "-"}</td>
+              <td>${row.close_reason || "-"}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function renderState(data) {
+    latestState = data;
+    const strategy = data.strategy_state || {};
+    const summary = data.summary || {};
+    const currentRun = summary.current_run || null;
+    const historical = summary.historical || null;
+    const position = data.position;
+    const pendingOpen = data.pending_open;
+    const pendingAi = data.pending_ai_suggestion;
+    const runtimeStatus = data.runtime_update_status;
+
+    const statusClass = strategy.running ? "status-running" : "status-stopped";
+    document.getElementById("strategy-status").innerHTML = [
+      kvRow("服务时间", data.server_time),
+      kvRow("运行 ID", data.run_id),
+      kvRow("状态", `<span><span class="status-dot ${statusClass}"></span>${strategy.running ? "运行中" : "已停止"}</span>`),
+      kvRow("启动时间", strategy.started_at),
+      kvRow("停止时间", strategy.stopped_at),
+      kvRow("线程存活", strategy.thread_alive ? "是" : "否"),
+      kvRow("消息", strategy.last_message),
+      kvRow("最近错误", strategy.last_error || "-")
+    ].join("");
+
+    document.getElementById("runtime-update-status").innerHTML = renderRuntimeStatus(runtimeStatus);
+    document.getElementById("summary-current").innerHTML = renderSummaryBlock(currentRun);
+    document.getElementById("summary-historical").innerHTML = renderSummaryBlock(historical);
+
+    document.getElementById("position-metrics").innerHTML = position ? [
+      kvRow("方向", position.side),
+      kvRow("开仓时间", position.entry_time),
+      kvRow("开仓价", position.entry_price),
+      kvRow("数量", position.qty),
+      kvRow("名义金额", position.notional_usdt),
+      kvRow("状态", position.status)
+    ].join("") : '<div class="muted">当前无持仓</div>';
+
+    document.getElementById("pending-open").innerHTML = pendingOpen ? [
+      kvRow("信号时间", pendingOpen.signal_kline_open_time),
+      kvRow("待开方向", pendingOpen.decision?.side || "-"),
+      kvRow("多头分数", pendingOpen.decision?.long_score || 0),
+      kvRow("空头分数", pendingOpen.decision?.short_score || 0)
+    ].join("") : '<div class="muted">当前没有待开仓信号</div>';
+
+    document.getElementById("pending-ai").innerHTML = renderPendingAI(pendingAi);
+    document.getElementById("recent-trades-table").innerHTML = renderTrades(data.recent_trades || []);
+    document.getElementById("main-log").textContent = (data.logs?.main || []).join("\n");
+    document.getElementById("error-log").textContent = (data.logs?.error || []).join("\n");
+  }
+
+  async function refreshState(showHint = false) {
+    const result = await api("/api/state");
+    renderState(result.data);
+    if (showHint) showFlash("状态已刷新");
+  }
+
+  async function startStrategy() {
+    const result = await api("/api/start", "POST");
+    renderState(result.data);
+    showFlash(result.message, !result.ok);
+  }
+
+  async function stopStrategy() {
+    const result = await api("/api/stop", "POST");
+    renderState(result.data);
+    showFlash(result.message, !result.ok);
+  }
+
+  async function analyzeAI() {
+    const result = await api("/api/ai/analyze", "POST");
+    renderState(result.data);
+    showFlash(result.ok ? "AI 建议已生成，请审核后应用" : result.message, !result.ok);
+  }
+
+  async function rejectAIProposal() {
+    const result = await api("/api/ai/reject", "POST");
+    renderState(result.data);
+    showFlash(result.message, !result.ok);
+  }
+
+  let aiEditBuffer = {};
+
+  function toggleAISuggestion(checkbox) {
+    const param = checkbox.getAttribute("data-param");
+    if (!aiEditBuffer[param]) aiEditBuffer[param] = {};
+    aiEditBuffer[param].enabled = checkbox.checked;
+  }
+
+  function editAISuggestionValue(input) {
+    const param = input.getAttribute("data-param");
+    if (!aiEditBuffer[param]) aiEditBuffer[param] = {};
+    aiEditBuffer[param].current_value = input.value;
+  }
+
+  async function applyAIProposal() {
+    if (Object.keys(aiEditBuffer).length > 0) {
+      const suggestions = Object.entries(aiEditBuffer).map(([param, changes]) => ({
+        param,
+        ...changes
+      }));
+      await api("/api/ai/proposal/update", "POST", { suggestions });
+      aiEditBuffer = {};
+    }
+
+    const result = await api("/api/ai/apply", "POST");
+    renderState(result.data);
+    showFlash(result.message, !result.ok);
+  }
+
+  refreshState();
+  setInterval(refreshState, 5000);
+</script>
+{% endblock %}

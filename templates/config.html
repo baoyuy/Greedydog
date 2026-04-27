@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+
+{% block title %}量化策略配置页{% endblock %}
+{% block nav_config %}active{% endblock %}
+{% block hero_desc %}参数查看与修改；运行中可改参数立即生效或下周期生效{% endblock %}
+
+{% block content %}
+  <div id="config-groups"></div>
+
+  <div class="card" id="restart-notice" style="display:none; background:#fff3cd; border-color:#ffc107">
+    <h2 style="color:#856404">⚠️ 需要重启</h2>
+    <p style="color:#856404; margin:0 0 12px">您修改了需要重启才能生效的配置，请点击下方按钮重启策略线程。</p>
+    <button onclick="restartStrategy()" style="background:#dc3545">立即重启策略</button>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  let configSchema = null;
+  let currentConfig = null;
+
+  function getFieldInputType(field) {
+    if (field.type === "password") return "password";
+    if (field.type === "int" || field.type === "float") return "number";
+    return "text";
+  }
+
+  function renderConfigGroups(schema, current) {
+    const container = document.getElementById("config-groups");
+    let html = "";
+
+    for (const [groupKey, group] of Object.entries(schema)) {
+      html += `<div class="card"><h2>${group.label}</h2><form id="form-${groupKey}" onsubmit="saveGroupConfig(event, '${groupKey}')">`;
+
+      for (const field of group.fields) {
+        const value = current[field.key] ?? "";
+        const timingLabel = field.effective_timing === "immediate" ? "立即生效" :
+                           field.effective_timing === "next_cycle" ? "下周期生效" : "需重启";
+
+        if (field.type === "bool") {
+          html += `<div class="checkbox-row">
+            <input id="${field.key}" name="${field.key}" type="checkbox" ${value ? 'checked' : ''}>
+            <label for="${field.key}">${field.label} <span class="muted">(${timingLabel})</span></label>
+          </div>`;
+        } else if (field.type === "time") {
+          html += `<div class="field">
+            <label for="${field.key}">${field.label} <span class="muted">(${timingLabel})</span></label>
+            <input id="${field.key}" name="${field.key}" type="time" value="${value}">
+          </div>`;
+        } else {
+          const inputType = getFieldInputType(field);
+          const step = field.type === "float" ? "0.0001" : "1";
+          const placeholder = field.type === "password" ? "留空不修改" : "";
+          html += `<div class="field">
+            <label for="${field.key}">${field.label} <span class="muted">(${timingLabel}${field.type === 'password' ? '，留空不覆盖' : ''})</span></label>
+            <input id="${field.key}" name="${field.key}" type="${inputType}" ${inputType === "number" ? `step="${step}"` : ""} value="${value}" placeholder="${placeholder}">
+          </div>`;
+        }
+      }
+
+      html += `<button type="submit">保存 ${group.label}</button></form></div>`;
+    }
+
+    container.innerHTML = html;
+  }
+
+  async function loadConfig() {
+    const schemaResult = await api("/api/config/schema");
+    const currentResult = await api("/api/config/current");
+    configSchema = schemaResult.schema;
+    currentConfig = currentResult.current;
+    renderConfigGroups(configSchema, currentConfig);
+  }
+
+  async function saveGroupConfig(event, groupKey) {
+    event.preventDefault();
+    const form = document.getElementById(`form-${groupKey}`);
+    const formData = new FormData(form);
+    const updates = {};
+
+    for (const field of configSchema[groupKey].fields) {
+      const key = field.key;
+      if (field.type === "bool") {
+        updates[key] = formData.has(key);
+      } else if (field.type === "int") {
+        updates[key] = parseInt(formData.get(key) || "0");
+      } else if (field.type === "float") {
+        updates[key] = parseFloat(formData.get(key) || "0");
+      } else {
+        updates[key] = formData.get(key) || "";
+      }
+    }
+
+    const result = await api("/api/config/update", "POST", updates);
+    if (result.ok) {
+      currentConfig = result.current;
+      renderConfigGroups(configSchema, currentConfig);
+
+      const hasRestart = configSchema[groupKey].fields.some(field => field.effective_timing === "restart_required");
+      document.getElementById("restart-notice").style.display = hasRestart ? "block" : "none";
+    }
+
+    showFlash(result.message, !result.ok);
+  }
+
+  async function restartStrategy() {
+    const result = await api("/api/restart", "POST");
+    if (result.ok) {
+      document.getElementById("restart-notice").style.display = "none";
+    }
+    showFlash(result.ok ? "策略已重启" : result.message, !result.ok);
+  }
+
+  loadConfig();
+</script>
+{% endblock %}
