@@ -18,6 +18,16 @@
   </div>
 
   <div class="card">
+    <h2>交易模式</h2>
+    <div id="trading-mode-status"></div>
+  </div>
+
+  <div class="card" id="live-account-card" style="display:none">
+    <h2>实盘账户</h2>
+    <div id="live-account-info"></div>
+  </div>
+
+  <div class="card">
     <h2>参数生效状态</h2>
     <div id="runtime-update-status"></div>
   </div>
@@ -204,6 +214,8 @@
     const pendingOpen = data.pending_open;
     const pendingAi = data.pending_ai_suggestion;
     const runtimeStatus = data.runtime_update_status;
+    const tradingMode = data.trading_mode || {};
+    const liveAccount = data.live_account;
 
     const statusClass = strategy.running ? "status-running" : "status-stopped";
     document.getElementById("strategy-status").innerHTML = [
@@ -218,6 +230,26 @@
     ].join("");
 
     document.getElementById("runtime-update-status").innerHTML = renderRuntimeStatus(runtimeStatus);
+
+    document.getElementById("trading-mode-status").innerHTML = [
+      kvRow("当前模式", tradingMode.mode === "LIVE" ? "实盘" : "模拟"),
+      kvRow("API 已配置", tradingMode.api_configured ? "是" : "否"),
+      kvRow("API 地址", tradingMode.base_url || "-")
+    ].join("");
+
+    if (tradingMode.mode === "LIVE" && liveAccount) {
+      document.getElementById("live-account-card").style.display = "block";
+      document.getElementById("live-account-info").innerHTML = [
+        kvRow("钱包余额", liveAccount.total_wallet_balance || "-"),
+        kvRow("未实现盈亏", liveAccount.total_unrealized_profit || "-"),
+        kvRow("可用余额", liveAccount.available_balance || "-"),
+        kvRow("持仓数量", (liveAccount.positions || []).length)
+      ].join("");
+    } else {
+      document.getElementById("live-account-card").style.display = "none";
+      document.getElementById("live-account-info").innerHTML = "";
+    }
+
     document.getElementById("summary-current").innerHTML = renderSummaryBlock(currentRun);
     document.getElementById("summary-historical").innerHTML = renderSummaryBlock(historical);
 

@@ -25,11 +25,13 @@ import csv
 import json
 import argparse
 import threading
+from decimal import Decimal, ROUND_DOWN
 import requests
 import pandas as pd
 
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from binance_client import BinanceClient
 
 # ============================================================
 # 一、读取 .env 配置
@@ -215,6 +217,11 @@ AI_BLOCKED_PARAMS = [
     ).split(",") if x.strip()
 ]
 
+TRADING_MODE = os.getenv("TRADING_MODE", "SIMULATION").upper()
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").strip()
+
 PARAM_TYPE_MAP = {
     "EMA_FAST": int,
     "EMA_SLOW": int,
@@ -247,7 +254,11 @@ PARAM_TYPE_MAP = {
     "AI_AUTO_TRIGGER_MIN_WIN_RATE": float,
     "AI_AUTO_TRIGGER_MIN_TRADES": int,
     "AI_REQUIRE_CONFIRM_ON_MANUAL": bool,
-    "AI_REQUIRE_CONFIRM_ON_AUTO": bool
+    "AI_REQUIRE_CONFIRM_ON_AUTO": bool,
+    "TRADING_MODE": str,
+    "BINANCE_API_KEY": str,
+    "BINANCE_API_SECRET": str,
+    "BINANCE_BASE_URL": str
 }
 
 
@@ -304,6 +315,15 @@ CONFIG_SCHEMA = {
             {"key": "PROXY_URL", "label": "代理地址", "type": "string", "runtime_mutable": True, "effective_timing": "immediate"}
         ]
     },
+    "trading_mode": {
+        "label": "交易模式配置",
+        "fields": [
+            {"key": "TRADING_MODE", "label": "交易模式", "type": "string", "runtime_mutable": False, "effective_timing": "restart_required"},
+            {"key": "BINANCE_API_KEY", "label": "币安 API Key", "type": "password", "runtime_mutable": False, "effective_timing": "restart_required"},
+            {"key": "BINANCE_API_SECRET", "label": "币安 API Secret", "type": "password", "runtime_mutable": False, "effective_timing": "restart_required"},
+            {"key": "BINANCE_BASE_URL", "label": "币安 API 地址", "type": "string", "runtime_mutable": False, "effective_timing": "restart_required"}
+        ]
+    },
     "ai": {
         "label": "AI 参数优化",
         "fields": [
@@ -339,6 +359,15 @@ def get_proxies():
 
 
 PROXIES = get_proxies()
+
+binance_client = None
+if BINANCE_API_KEY and BINANCE_API_SECRET and BINANCE_BASE_URL:
+    binance_client = BinanceClient(
+        api_key=BINANCE_API_KEY,
+        api_secret=BINANCE_API_SECRET,
+        base_url=BINANCE_BASE_URL,
+        proxies=PROXIES
+    )
 
 
 def now_str():
@@ -1152,6 +1181,189 @@ def get_pending_open_snapshot():
     }
 
 
+def get_live_account_snapshot():
+    """获取实盘账户快照"""
+    if not binance_client:
+        return None
+
+    try:
+        account = binance_client.get_account()
+        positions = binance_client.get_position_risk()
+
+        return {
+            "total_wallet_balance": account.get('totalWalletBalance'),
+            "total_unrealized_profit": account.get('totalUnrealizedProfit'),
+            "available_balance": account.get('availableBalance'),
+            "positions": [
+                {
+                    "symbol": p['symbol'],
+                    "position_amt": p['positionAmt'],
+                    "entry_price": p['entryPrice'],
+                    "unrealized_profit": p['unRealizedProfit']
+                }
+                for p in positions if float(p['positionAmt']) != 0
+            ]
+        }
+    except Exception as e:
+        log_error(f"查询账户信息失败: {e}")
+        return None
+
+
+def get_symbol_exchange_info(symbol):
+    """获取交易对规则信息"""
+    try:
+        if binance_client:
+            data = binance_client.get_exchange_info()
+        else:
+            url = f"{BASE_URL}/fapi/v1/exchangeInfo"
+            data = http_get(url)
+
+        for item in data.get("symbols", []):
+            if item.get("symbol") == symbol:
+                return item
+    except Exception as e:
+        log_error(f"获取交易对规则失败: {e}")
+
+    return None
+
+
+def normalize_order_qty(symbol, qty):
+    """按交易规则规范化下单数量"""
+    info = get_symbol_exchange_info(symbol)
+    if not info:
+        return qty
+
+    quantity_precision = int(info.get("quantityPrecision", 8))
+    filters = info.get("filters", [])
+    step_size = None
+    min_qty = None
+
+    for item in filters:
+        if item.get("filterType") == "LOT_SIZE":
+            step_size = float(item.get("stepSize", "0"))
+            min_qty = float(item.get("minQty", "0"))
+            break
+
+    normalized = round(qty, quantity_precision)
+
+    if step_size and step_size > 0:
+        normalized = int(normalized / step_size) * step_size
+        normalized = round(normalized, quantity_precision)
+
+    if min_qty and normalized < min_qty:
+        raise ValueError(f"下单数量 {normalized} 小于最小下单数量 {min_qty}")
+
+    return normalized
+
+
+def _decimal_places_from_step(step_size_text):
+    """根据 stepSize 文本推导小数位数"""
+    if not step_size_text or "." not in step_size_text:
+        return 0
+    stripped = step_size_text.rstrip("0")
+    if stripped.endswith("."):
+        return 0
+    return len(stripped.split(".")[1])
+
+
+def format_order_qty(symbol, qty):
+    """按 Binance 交易规则格式化数量字符串，避免浮点误差"""
+    info = get_symbol_exchange_info(symbol)
+    if not info:
+        return str(qty)
+
+    quantity_precision = int(info.get("quantityPrecision", 8))
+    filters = info.get("filters", [])
+    step_size_text = None
+    min_qty_decimal = None
+
+    for item in filters:
+        if item.get("filterType") == "LOT_SIZE":
+            step_size_text = item.get("stepSize", "0")
+            min_qty_text = item.get("minQty", "0")
+            min_qty_decimal = Decimal(min_qty_text)
+            break
+
+    qty_decimal = Decimal(str(qty))
+
+    if step_size_text and Decimal(step_size_text) > 0:
+        step_decimal = Decimal(step_size_text)
+        qty_decimal = (qty_decimal / step_decimal).to_integral_value(rounding=ROUND_DOWN) * step_decimal
+        decimal_places = _decimal_places_from_step(step_size_text)
+        quantizer = Decimal("1") if decimal_places <= 0 else Decimal(f"1e-{decimal_places}")
+        qty_decimal = qty_decimal.quantize(quantizer, rounding=ROUND_DOWN)
+    else:
+        quantizer = Decimal("1") if quantity_precision <= 0 else Decimal(f"1e-{quantity_precision}")
+        qty_decimal = qty_decimal.quantize(quantizer, rounding=ROUND_DOWN)
+
+    if min_qty_decimal is not None and qty_decimal < min_qty_decimal:
+        raise ValueError(f"下单数量 {qty_decimal} 小于最小下单数量 {min_qty_decimal}")
+
+    qty_text = format(qty_decimal, "f")
+    if "." in qty_text:
+        qty_text = qty_text.rstrip("0").rstrip(".")
+    return qty_text or "0"
+
+
+def get_order_trades(symbol, order_id, max_attempts=5, retry_delay_seconds=0.2):
+    """查询订单对应的真实成交明细，短轮询等待明细落账后再返回"""
+    if not binance_client:
+        return []
+
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            params = {"symbol": symbol, "orderId": order_id}
+            trades = binance_client._request("GET", "/fapi/v1/userTrades", params, signed=True)
+            if trades:
+                if attempt > 1:
+                    log_trade(
+                        f"成交明细延迟到账，重试后获取成功 | symbol={symbol} | order_id={order_id} | "
+                        f"attempt={attempt}/{max_attempts} | trade_count={len(trades)}"
+                    )
+                return trades
+        except Exception as e:
+            last_error = e
+
+        if attempt < max_attempts:
+            time.sleep(retry_delay_seconds)
+
+    if last_error is not None:
+        log_error(
+            f"查询订单成交明细失败 | symbol={symbol} | order_id={order_id} | "
+            f"attempts={max_attempts} | error={last_error}"
+        )
+    else:
+        log_error(
+            f"订单已成交但未在轮询窗口内查到成交明细 | symbol={symbol} | order_id={order_id} | "
+            f"attempts={max_attempts} | retry_delay_seconds={retry_delay_seconds}"
+        )
+
+    return []
+
+
+def aggregate_order_trade_details(trades):
+    """聚合订单成交明细，得到真实手续费和已实现盈亏"""
+    total_commission = 0.0
+    total_realized_pnl = 0.0
+    commission_asset = None
+
+    for trade in trades or []:
+        commission = float(trade.get("commission", 0) or 0)
+        realized_pnl = float(trade.get("realizedPnl", 0) or 0)
+        total_commission += abs(commission)
+        total_realized_pnl += realized_pnl
+        if not commission_asset:
+            commission_asset = trade.get("commissionAsset")
+
+    return {
+        "commission": total_commission,
+        "realized_pnl": total_realized_pnl,
+        "commission_asset": commission_asset or "USDT"
+    }
+
+
 def get_dashboard_snapshot():
     return {
         "server_time": now_str(),
@@ -1164,6 +1376,12 @@ def get_dashboard_snapshot():
         "pending_open": get_pending_open_snapshot(),
         "pending_ai_suggestion": get_pending_ai_suggestion_snapshot(),
         "runtime_update_status": get_runtime_status(),
+        "trading_mode": {
+            "mode": TRADING_MODE,
+            "api_configured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
+            "base_url": BINANCE_BASE_URL
+        },
+        "live_account": get_live_account_snapshot() if TRADING_MODE == "LIVE" else None,
         "recent_trades": read_recent_jsonl(TRADE_DETAIL_JSONL_FILE, limit=20),
         "recent_ai_records": read_recent_jsonl(AI_SUGGESTION_JSONL_FILE, limit=10),
         "logs": {
@@ -1550,7 +1768,8 @@ def init_csv():
                 "close_reason",
                 "long_score",
                 "short_score",
-                "decision_reason"
+                "decision_reason",
+                "trading_mode"
             ])
 
 
@@ -1607,6 +1826,11 @@ def build_run_config_snapshot():
         "proxy_url": PROXY_URL,
         "cycle_trigger_window_seconds": CYCLE_TRIGGER_WINDOW_SECONDS,
         "open_retry_interval_seconds": OPEN_RETRY_INTERVAL_SECONDS,
+        "trading_mode": TRADING_MODE,
+        "binance": {
+            "base_url": BINANCE_BASE_URL,
+            "api_configured": bool(BINANCE_API_KEY and BINANCE_API_SECRET)
+        },
         "ai": {
             "enabled": AI_ENABLED,
             "base_url": AI_BASE_URL,
@@ -2306,9 +2530,17 @@ def clear_pending_open():
 # ============================================================
 
 def open_position_from_decision(decision, signal_kline_open_time):
-    """
-    根据决策开仓
-    """
+    """开仓入口 - 根据模式分发"""
+    if TRADING_MODE == "SIMULATION":
+        return simulate_open_position(decision, signal_kline_open_time)
+    elif TRADING_MODE == "LIVE":
+        return live_open_position(decision, signal_kline_open_time)
+    else:
+        raise ValueError(f"Unknown TRADING_MODE: {TRADING_MODE}")
+
+
+def simulate_open_position(decision, signal_kline_open_time):
+    """模拟开仓 - 保持当前逻辑不变"""
     global position
 
     side = decision["side"]
@@ -2345,6 +2577,128 @@ def open_position_from_decision(decision, signal_kline_open_time):
     log_trade(f"下单金额: {entry_notional:.6f} U")
     log_trade(f"下单数量: {qty:.6f}")
     log_trade(f"开仓手续费: {entry_fee:.6f} U")
+    log_trade(f"最大持仓时间: {MAX_HOLD_SECONDS} 秒")
+    log_trade(f"杠杆(仅展示): {LEVERAGE} 倍")
+    log_trade(f"多头得分: {decision.get('long_score', 0)}")
+    log_trade(f"空头得分: {decision.get('short_score', 0)}")
+    log_trade("开仓原因:")
+    for i, reason in enumerate(decision.get("reasons", []), 1):
+        log_trade(f"  {i}. {reason}")
+
+
+def live_open_position(decision, signal_kline_open_time):
+    """实盘开仓 - 第二阶段：真实下单并记录交易所返回数据"""
+    global position, binance_client
+
+    if not binance_client:
+        raise ValueError("实盘模式未配置币安 API")
+
+    side = decision["side"]
+    order_side = "BUY" if side == "LONG" else "SELL"
+
+    # 查询真实手续费率
+    try:
+        commission_info = binance_client.get_commission_rate(SYMBOL)
+        taker_rate = float(commission_info['takerCommissionRate'])
+        log_trade(f"[实盘模式] 查询到真实 taker 费率: {taker_rate}")
+    except Exception as e:
+        log_error(f"查询手续费率失败: {e}，使用配置费率")
+        taker_rate = TAKER_FEE_RATE
+
+    # 确认不存在真实持仓
+    try:
+        positions = binance_client.get_position_risk(SYMBOL)
+        for pos in positions:
+            if float(pos['positionAmt']) != 0:
+                raise ValueError(f"检测到真实持仓未清空，拒绝重复开仓: {pos}")
+    except Exception:
+        raise
+
+    mark_price = get_current_price(SYMBOL)
+    raw_qty = NOTIONAL_USDT / mark_price
+    qty = normalize_order_qty(SYMBOL, raw_qty)
+    qty_text = format_order_qty(SYMBOL, qty)
+
+    if float(qty_text) <= 0:
+        raise ValueError("规范化后的下单数量小于等于 0，无法下单")
+
+    log_trade(f"[实盘模式] 准备下单 | side={order_side} | qty={qty_text} | 估算价格={mark_price:.6f}")
+
+    order = binance_client.new_order(
+        symbol=SYMBOL,
+        side=order_side,
+        order_type="MARKET",
+        quantity=qty_text
+    )
+
+    order_id = order.get("orderId")
+    if not order_id:
+        raise ValueError(f"下单返回缺少 orderId: {order}")
+
+    order_detail = binance_client.get_order(SYMBOL, order_id)
+    entry_trade_rows = get_order_trades(SYMBOL, order_id)
+
+    executed_qty = float(order_detail.get("executedQty", 0) or 0)
+    avg_price = float(order_detail.get("avgPrice", 0) or 0)
+    cum_quote = float(order_detail.get("cumQuote", 0) or 0)
+    status = order_detail.get("status", "UNKNOWN")
+
+    if status != "FILLED":
+        raise ValueError(f"市价单未完全成交，当前状态={status} | order={order_detail}")
+
+    if executed_qty <= 0 or avg_price <= 0:
+        raise ValueError(f"成交数据异常 | executedQty={executed_qty} avgPrice={avg_price}")
+
+    entry_notional = cum_quote if cum_quote > 0 else executed_qty * avg_price
+
+    trade_details = aggregate_order_trade_details(entry_trade_rows)
+    entry_fee = trade_details["commission"]
+    commission_asset = trade_details["commission_asset"]
+
+    if entry_fee <= 0:
+        entry_fee = entry_notional * taker_rate
+        log_error(f"未获取到真实开仓手续费，临时按费率估算 | order_id={order_id} | fee={entry_fee}")
+        fee_source = "estimated_from_rate"
+    else:
+        fee_source = "exchange_trade_details"
+
+    trade_id = f"{SYMBOL}_{side}_{order_id}"
+
+    position = {
+        "run_id": RUN_ID,
+        "trade_id": trade_id,
+        "symbol": SYMBOL,
+        "side": side,
+        "entry_time": datetime.now(),
+        "entry_price": avg_price,
+        "qty": executed_qty,
+        "notional_usdt": NOTIONAL_USDT,
+        "entry_notional": entry_notional,
+        "entry_fee": entry_fee,
+        "entry_fee_source": fee_source,
+        "entry_commission_asset": commission_asset,
+        "taker_rate": taker_rate,
+        "decision_snapshot": decision,
+        "signal_kline_open_time": signal_kline_open_time,
+        "status": "OPEN",
+        "trading_mode": "LIVE",
+        "entry_order_id": order_id,
+        "entry_order_status": status,
+        "entry_raw_order": order_detail,
+        "entry_trade_details": entry_trade_rows
+    }
+
+    direction_text = "做多" if side == "LONG" else "做空"
+
+    log_trade("========== 开仓成功 ==========")
+    log_trade(f"[实盘] 交易对: {SYMBOL}")
+    log_trade(f"方向: {direction_text}")
+    log_trade(f"订单ID: {order_id}")
+    log_trade(f"开仓价(真实成交均价): {avg_price:.6f}")
+    log_trade(f"下单金额(真实成交额): {entry_notional:.6f} U")
+    log_trade(f"下单数量(真实成交量): {executed_qty:.6f}")
+    log_trade(f"开仓手续费: {entry_fee:.6f} {commission_asset}")
+    log_trade(f"手续费来源: {fee_source}")
     log_trade(f"最大持仓时间: {MAX_HOLD_SECONDS} 秒")
     log_trade(f"杠杆(仅展示): {LEVERAGE} 倍")
     log_trade(f"多头得分: {decision.get('long_score', 0)}")
@@ -2408,9 +2762,17 @@ def retry_pending_open_if_needed():
 # ============================================================
 
 def close_position(exit_price, close_reason="TIME_EXIT"):
-    """
-    平仓并写入 CSV / JSONL / 统计
-    """
+    """平仓入口 - 根据模式分发"""
+    if TRADING_MODE == "SIMULATION":
+        return simulate_close_position(exit_price, close_reason)
+    elif TRADING_MODE == "LIVE":
+        return live_close_position(close_reason)
+    else:
+        raise ValueError(f"Unknown TRADING_MODE: {TRADING_MODE}")
+
+
+def simulate_close_position(exit_price, close_reason):
+    """模拟平仓 - 保持当前逻辑不变"""
     global position
 
     if position is None:
@@ -2442,7 +2804,6 @@ def close_position(exit_price, close_reason="TIME_EXIT"):
     reasons = decision_snapshot.get("reasons", [])
     reason_text = " | ".join(reasons)
 
-    # CSV 记录（便于 Excel 看）
     csv_row = [
         RUN_ID,
         position["trade_id"],
@@ -2467,7 +2828,8 @@ def close_position(exit_price, close_reason="TIME_EXIT"):
         close_reason,
         long_score,
         short_score,
-        reason_text
+        reason_text,
+        "SIMULATION"
     ]
 
     ensure_parent_dir(TRADE_CSV_FILE)
@@ -2475,7 +2837,6 @@ def close_position(exit_price, close_reason="TIME_EXIT"):
         writer = csv.writer(f)
         writer.writerow(csv_row)
 
-    # 详细 JSONL 记录（便于后续程序分析）
     detail_record = {
         "run_id": RUN_ID,
         "trade_id": position["trade_id"],
@@ -2504,11 +2865,8 @@ def close_position(exit_price, close_reason="TIME_EXIT"):
     }
 
     append_jsonl(TRADE_DETAIL_JSONL_FILE, detail_record)
-
-    # 更新统计
     update_stats(net_pnl, gross_pnl, total_fee)
 
-    # 输出交易日志
     log_trade("========== 平仓成功 ==========")
     log_trade(f"交易对: {SYMBOL}")
     log_trade(f"方向: {direction_text}")
@@ -2520,6 +2878,198 @@ def close_position(exit_price, close_reason="TIME_EXIT"):
     log_trade(f"平仓手续费: {exit_fee:.6f} U")
     log_trade(f"总手续费: {total_fee:.6f} U")
     log_trade(f"毛利润: {gross_pnl:.6f} U")
+    log_trade(f"净利润: {net_pnl:.6f} U")
+    log_trade(f"收益率: {pnl_pct:.4%}")
+    log_trade(f"结果: {result_text}")
+    log_trade(f"持仓时间: {hold_seconds} 秒")
+    log_trade(f"平仓原因: {close_reason}")
+
+    print_summary()
+    maybe_trigger_auto_ai_optimizer()
+
+    position = None
+
+
+def live_close_position(close_reason):
+    """实盘平仓 - 第二阶段：真实下单并尽量使用交易所回报数据"""
+    global position, binance_client
+
+    if position is None:
+        return
+
+    if not binance_client:
+        raise ValueError("实盘模式未配置币安 API")
+
+    qty = position["qty"]
+    entry_price = position["entry_price"]
+    side = position["side"]
+    order_side = "SELL" if side == "LONG" else "BUY"
+    qty_text = format_order_qty(SYMBOL, qty)
+
+    if float(qty_text) <= 0:
+        raise ValueError("平仓数量小于等于 0，无法下单")
+
+    log_trade(f"[实盘模式] 准备平仓 | side={order_side} | qty={qty_text} | close_reason={close_reason}")
+
+    order = binance_client.new_order(
+        symbol=SYMBOL,
+        side=order_side,
+        order_type="MARKET",
+        quantity=qty_text,
+        reduceOnly="true"
+    )
+
+    order_id = order.get("orderId")
+    if not order_id:
+        raise ValueError(f"平仓返回缺少 orderId: {order}")
+
+    order_detail = binance_client.get_order(SYMBOL, order_id)
+    exit_trade_rows = get_order_trades(SYMBOL, order_id)
+
+    executed_qty = float(order_detail.get("executedQty", 0) or 0)
+    avg_price = float(order_detail.get("avgPrice", 0) or 0)
+    cum_quote = float(order_detail.get("cumQuote", 0) or 0)
+    status = order_detail.get("status", "UNKNOWN")
+
+    if status != "FILLED":
+        raise ValueError(f"平仓市价单未完全成交，当前状态={status} | order={order_detail}")
+
+    if executed_qty <= 0 or avg_price <= 0:
+        raise ValueError(f"平仓成交数据异常 | executedQty={executed_qty} avgPrice={avg_price}")
+
+    if executed_qty - qty > 1e-10:
+        raise ValueError(f"平仓成交数量超过持仓数量 | executedQty={executed_qty} | positionQty={qty}")
+
+    exit_time = datetime.now()
+    exit_notional = cum_quote if cum_quote > 0 else executed_qty * avg_price
+
+    trade_details = aggregate_order_trade_details(exit_trade_rows)
+    exit_fee = trade_details["commission"]
+    commission_asset = trade_details["commission_asset"]
+    realized_pnl_from_exchange = trade_details["realized_pnl"]
+
+    if side == "LONG":
+        gross_pnl = (avg_price - entry_price) * executed_qty
+    else:
+        gross_pnl = (entry_price - avg_price) * executed_qty
+
+    if exit_fee <= 0:
+        taker_rate = position.get("taker_rate", TAKER_FEE_RATE)
+        exit_fee = exit_notional * taker_rate
+        log_error(f"未获取到真实平仓手续费，临时按费率估算 | order_id={order_id} | fee={exit_fee}")
+    else:
+        taker_rate = exit_fee / exit_notional if exit_notional else position.get("taker_rate", TAKER_FEE_RATE)
+
+    total_fee = position["entry_fee"] + exit_fee
+    net_pnl_by_formula = gross_pnl - total_fee
+
+    if trade_details["commission"] > 0:
+        net_pnl = realized_pnl_from_exchange - position["entry_fee"]
+    else:
+        net_pnl = net_pnl_by_formula
+
+    pnl_pct = net_pnl / position["entry_notional"] if position["entry_notional"] != 0 else 0
+    hold_seconds = int((exit_time - position["entry_time"]).total_seconds())
+
+    result_text = "盈利" if net_pnl > 0 else "亏损" if net_pnl < 0 else "持平"
+    direction_text = "做多" if side == "LONG" else "做空"
+
+    decision_snapshot = position.get("decision_snapshot", {})
+    long_score = decision_snapshot.get("long_score", 0)
+    short_score = decision_snapshot.get("short_score", 0)
+    reasons = decision_snapshot.get("reasons", [])
+    reason_text = " | ".join(reasons)
+
+    csv_row = [
+        RUN_ID,
+        position["trade_id"],
+        position["symbol"],
+        position["side"],
+        position["entry_time"].strftime("%Y-%m-%d %H:%M:%S"),
+        exit_time.strftime("%Y-%m-%d %H:%M:%S"),
+        round(entry_price, 6),
+        round(avg_price, 6),
+        round(executed_qty, 6),
+        round(position["notional_usdt"], 6),
+        round(position["entry_notional"], 6),
+        round(exit_notional, 6),
+        round(position["entry_fee"], 6),
+        round(exit_fee, 6),
+        round(total_fee, 6),
+        round(gross_pnl, 6),
+        round(net_pnl, 6),
+        round(pnl_pct, 6),
+        hold_seconds,
+        "CLOSED",
+        close_reason,
+        long_score,
+        short_score,
+        reason_text,
+        "LIVE"
+    ]
+
+    ensure_parent_dir(TRADE_CSV_FILE)
+    with open(TRADE_CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(csv_row)
+
+    detail_record = {
+        "run_id": RUN_ID,
+        "trade_id": position["trade_id"],
+        "symbol": position["symbol"],
+        "side": position["side"],
+        "entry_time": position["entry_time"].strftime("%Y-%m-%d %H:%M:%S"),
+        "exit_time": exit_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_price": round(entry_price, 8),
+        "exit_price": round(avg_price, 8),
+        "qty": round(executed_qty, 8),
+        "notional_usdt": round(position["notional_usdt"], 8),
+        "entry_notional": round(position["entry_notional"], 8),
+        "exit_notional": round(exit_notional, 8),
+        "entry_fee": round(position["entry_fee"], 8),
+        "exit_fee": round(exit_fee, 8),
+        "total_fee": round(total_fee, 8),
+        "gross_pnl": round(gross_pnl, 8),
+        "net_pnl": round(net_pnl, 8),
+        "net_pnl_by_formula": round(net_pnl_by_formula, 8),
+        "realized_pnl_from_exchange": round(realized_pnl_from_exchange, 8),
+        "pnl_pct": round(pnl_pct, 8),
+        "hold_seconds": hold_seconds,
+        "status": "CLOSED",
+        "close_reason": close_reason,
+        "signal_kline_open_time": to_text_time(position.get("signal_kline_open_time")),
+        "decision_snapshot": decision_snapshot,
+        "config_file": RUN_CONFIG_FILE,
+        "trading_mode": "LIVE",
+        "entry_order_id": position.get("entry_order_id"),
+        "entry_order_status": position.get("entry_order_status"),
+        "entry_raw_order": position.get("entry_raw_order"),
+        "entry_trade_details": position.get("entry_trade_details", []),
+        "exit_order_id": order_id,
+        "exit_order_status": status,
+        "exit_raw_order": order_detail,
+        "exit_trade_details": exit_trade_rows,
+        "commission_asset": commission_asset,
+        "fee_source": "exchange_trade_details" if trade_details["commission"] > 0 else "estimated_from_rate"
+    }
+
+    append_jsonl(TRADE_DETAIL_JSONL_FILE, detail_record)
+    update_stats(net_pnl, gross_pnl, total_fee)
+
+    log_trade("========== 平仓成功 ==========")
+    log_trade(f"[实盘] 交易对: {SYMBOL}")
+    log_trade(f"方向: {direction_text}")
+    log_trade(f"开仓订单ID: {position.get('entry_order_id')}")
+    log_trade(f"平仓订单ID: {order_id}")
+    log_trade(f"开仓价(真实成交均价): {entry_price:.6f}")
+    log_trade(f"平仓价(真实成交均价): {avg_price:.6f}")
+    log_trade(f"开仓金额(真实成交额): {position['entry_notional']:.6f} U")
+    log_trade(f"平仓金额(真实成交额): {exit_notional:.6f} U")
+    log_trade(f"开仓手续费: {position['entry_fee']:.6f} U")
+    log_trade(f"平仓手续费: {exit_fee:.6f} {commission_asset}")
+    log_trade(f"总手续费: {total_fee:.6f} U")
+    log_trade(f"毛利润(公式): {gross_pnl:.6f} U")
+    log_trade(f"交易所已实现盈亏: {realized_pnl_from_exchange:.6f} U")
     log_trade(f"净利润: {net_pnl:.6f} U")
     log_trade(f"收益率: {pnl_pct:.4%}")
     log_trade(f"结果: {result_text}")
@@ -2560,7 +3110,8 @@ def print_position_status():
             gross_pnl = (position["entry_price"] - current_price) * qty
 
         estimated_exit_notional = qty * current_price
-        estimated_exit_fee = estimated_exit_notional * TAKER_FEE_RATE
+        estimated_exit_fee_rate = position.get("taker_rate", TAKER_FEE_RATE)
+        estimated_exit_fee = estimated_exit_notional * estimated_exit_fee_rate
         total_fee_so_far = position["entry_fee"] + estimated_exit_fee
         net_pnl = gross_pnl - total_fee_so_far
 
@@ -2578,7 +3129,7 @@ def print_position_status():
         log_position(f"下单金额: {position['entry_notional']:.6f} U")
         log_position(f"当前毛利润: {gross_pnl:.6f} U")
         log_position(f"预计平仓手续费: {estimated_exit_fee:.6f} U")
-        log_position(f"当前总手续费(估算): {total_fee_so_far:.6f} U")
+        log_position(f"当前总手续费(开仓真实+平仓估算): {total_fee_so_far:.6f} U")
         log_position(f"当前净利润: {net_pnl:.6f} U")
         log_position(f"当前状态: {state_text}")
         log_position(f"已持仓: {hold_seconds} 秒")
@@ -2944,6 +3495,7 @@ def reload_env_config():
     global TRADE_START_TIME, TRADE_END_TIME, STATUS_INTERVAL_SECONDS
     global CYCLE_TRIGGER_WINDOW_SECONDS, OPEN_RETRY_INTERVAL_SECONDS
     global INTERVAL_SECONDS, MAX_HOLD_SECONDS, PROXIES
+    global TRADING_MODE, BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_BASE_URL, binance_client
 
     load_dotenv(ENV_FILE_PATH, override=True)
 
@@ -2969,6 +3521,21 @@ def reload_env_config():
         MAX_HOLD_SECONDS = INTERVAL_SECONDS
 
     PROXIES = get_proxies()
+
+    TRADING_MODE = os.getenv("TRADING_MODE", "SIMULATION").upper()
+    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+    BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+    BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").strip()
+
+    if BINANCE_API_KEY and BINANCE_API_SECRET and BINANCE_BASE_URL:
+        binance_client = BinanceClient(
+            api_key=BINANCE_API_KEY,
+            api_secret=BINANCE_API_SECRET,
+            base_url=BINANCE_BASE_URL,
+            proxies=PROXIES
+        )
+    else:
+        binance_client = None
 
 
 def restart_strategy_background():
